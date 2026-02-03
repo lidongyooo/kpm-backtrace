@@ -206,7 +206,7 @@ static unsigned long get_lib_base(struct mm_struct *mm, struct vm_area_struct *v
 
 void print_stack(const char* type_name, int cu_uid, struct pt_regs* user_regs)
 {
-    if (cu_uid < 1000) {
+    if (cu_uid < 10000) {
         return;
     }
 
@@ -312,7 +312,7 @@ void before_exit(hook_fargs4_t *args, void *udata) {
 
     char* type_name = udata;
     int cu_uid = current_uid();
-    if (cu_uid < 1000) {
+    if (cu_uid < 10000) {
         return;
     }
 
