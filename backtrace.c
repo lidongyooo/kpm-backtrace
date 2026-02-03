@@ -14,7 +14,7 @@
 #include "linux/arch/arm64/include/asm/processor.h"
 #include "linux/include/linux/sched.h"
 #include "linux/include/linux/mm_types.h"
-
+#include <linux/kernel.h>
 
 KPM_NAME("kpm-backtrace");
 KPM_VERSION("1.0.0");
@@ -46,6 +46,10 @@ typedef struct mm_struct* (*find_get_task_mm)(struct task_struct*);
 typedef void (*find_mmput)(struct mm_struct *);
 typedef pid_t (*find_task_pid_nr_ns)(struct task_struct *task, int type, void *ns);
 typedef int (*find_show_map_vma)(struct seq_file *m, struct vm_area_struct *vma);
+typedef long (*find_oom_badness)(struct task_struct *p, unsigned long totalpages);
+typedef int (*find___arm64_sys_getppid)(void);
+typedef void (*el0_handler)(struct pt_regs *regs, unsigned long esr);
+typedef void (*arm64_force_sig_fault_handler)(int signo, int code, unsigned long far, const char *str);
 
 static find_memdup_user got_memdup_user = NULL;
 static find_kfree got_kfree = NULL;
@@ -56,6 +60,9 @@ static find_mmput got_mmput = NULL;
 static find_task_pid_nr_ns got_task_pid_nr_ns = NULL;
 static find_show_map_vma got_show_map_vma = NULL;
 static long (*probe_read)(void *dst, const void *src, size_t size) = NULL;
+static find_oom_badness got_oom_badness = NULL;
+static find___arm64_sys_getppid got___arm64_sys_getppid = NULL;
+
 
 struct exit_type {
     const char* name;
@@ -71,6 +78,18 @@ static struct exit_type exit_types[] = {
     {"tgkill", __NR_tgkill, 3},                        // 线程组终止
     {"tkill", __NR_tkill, 2},                          // 线程终止
     {"rt_tgsigqueueinfo", __NR_rt_tgsigqueueinfo, 4}  // 发送线程组信号
+};
+
+
+struct exception_type {
+    char* name;
+    void* backup;
+    void* origin;
+};
+
+static struct exception_type exception_types[] = {
+    {"arm64_force_sig_fault", 0x0, 0x0}, // 访问空指针、未映射内存、受保护内存
+    {"el0_undef", 0x0, 0x0} //执行未定义指令
 };
 
 
@@ -185,62 +204,13 @@ static unsigned long get_lib_base(struct mm_struct *mm, struct vm_area_struct *v
     return base;
 }
 
-
-void before_exit(hook_fargs4_t *args, void *udata) {
-    if (strcmp(control_status, "start") != 0) {
+void print_stack(const char* type_name, int cu_uid, struct pt_regs* user_regs)
+{
+    if (cu_uid < 1000) {
         return;
-    }
-
-    char* type_name = udata;
-    int cu_uid = current_uid();
-    if (cu_uid <= 0) {
-        return;
-    }
-
-     if (strcmp(type_name, "rt_sigqueueinfo") == 0 ||
-        strcmp(type_name, "kill") == 0 ||
-        strcmp(type_name, "tgkill") == 0 ||
-        strcmp(type_name, "tkill") == 0 ||
-        strcmp(type_name, "rt_tgsigqueueinfo") == 0) {
-
-        int sig = -1;
-        if (strcmp(type_name, "kill") == 0 || strcmp(type_name, "tkill") == 0) {
-            sig = args->arg1;
-        } else if (strcmp(type_name, "tgkill") == 0) {
-            sig = args->arg2;
-        } else if (strcmp(type_name, "rt_sigqueueinfo") == 0) {
-            sig = args->arg1;
-        } else if (strcmp(type_name, "rt_tgsigqueueinfo") == 0) {
-            sig = args->arg2;
-        }
-
-        if (sig > 0) {
-            int fatal_signals[] = {
-                2,  // SIGINT
-                3,  // SIGQUIT
-                6,  // SIGABRT
-                14, // SIGALRM
-                9,  // SIGKILL
-                15, // SIGTERM
-            };
-
-            int is_fatal = 0;
-            for (size_t i = 0; i < sizeof(fatal_signals)/sizeof(fatal_signals[0]); i++) {
-                if (sig == fatal_signals[i]) {
-                    is_fatal = 1;
-                    break;
-                }
-            }
-
-            if (!is_fatal) {
-                return;
-            }
-        }
     }
 
     struct task_struct* task = current;
-    struct pt_regs* user_regs = _task_pt_reg(task);
-
     if (!user_regs) {
         logke("No user regs");
         return;
@@ -264,10 +234,15 @@ void before_exit(hook_fargs4_t *args, void *udata) {
     char path_buf[256];
     uint64_t fp = user_regs->regs[29];
     uint64_t pc = user_regs->pc;
-
-    logke("=== User call %s Backtrace (PID:%d UID:%d) ===", type_name, pid, cu_uid);
     int depth = 0;
-    while (is_user_range(fp) && is_user_range(pc) && depth < 32) {
+    int max_depth = 32;
+    int output_offset = 0;
+    char output[256 * max_depth];
+    memset(output, 0, sizeof(output));
+
+    output_offset = snprintf(output, sizeof(output), "=== User call [%s] Backtrace (PID:%d TID:%d UID:%d) ===\n", type_name, got___arm64_sys_getppid(), pid, cu_uid);
+
+    while (is_user_range(fp) && is_user_range(pc) && depth < max_depth) {
         struct vm_area_struct *vma = got_find_vma(mm, pc);
         unsigned long vm_start = *(uint64_t*)vma;
         memset(path_buf, 0, sizeof(path_buf));
@@ -286,7 +261,13 @@ void before_exit(hook_fargs4_t *args, void *udata) {
             offset = pc;
         }
 
-        logke("UID:%d #%d pc=0x%llx!0x%lx %s", cu_uid, depth, pc - 4, offset - 4, path_buf);
+        if (strstr(path_buf, "/system/bin/")) {
+            goto clearmm;
+        }
+
+        // logke("UID:%d #%d pc=0x%llx!0x%lx %s", cu_uid, depth, pc - 4, offset - 4, path_buf);
+        output_offset += snprintf(output + output_offset, sizeof(output) - output_offset, "UID:%d #%d pc=0x%llx!0x%lx %s\n", cu_uid, depth, pc - 4, offset - 4, path_buf);
+        depth++;
 
         // 读取下一帧
         uint64_t next_fp, next_pc;
@@ -296,13 +277,117 @@ void before_exit(hook_fargs4_t *args, void *udata) {
 
         fp = next_fp;
         pc = next_pc;
-        depth++;
     }
 
+    if (depth <= 1) {
+        goto clearmm;
+    }
+
+    memset(path_buf, 0, sizeof(path_buf));
+    int index = 0;
+    int path_index = 0;
+    while (output[index]) {
+        if (output[index] == '\n') {
+            logke("%s", path_buf);
+            memset(path_buf, 0, path_index);
+            path_index = 0;
+        } else {
+            path_buf[path_index++] = output[index];
+        }
+
+        index++;
+    }
+
+    clearmm:
     if (got_mmput) {
         got_mmput(mm);
     }
 }
+
+
+void before_exit(hook_fargs4_t *args, void *udata) {
+    if (strcmp(control_status, "start") != 0) {
+        return;
+    }
+
+    char* type_name = udata;
+    int cu_uid = current_uid();
+    if (cu_uid < 1000) {
+        return;
+    }
+
+
+    struct task_struct* task = current;
+
+    if (got_oom_badness) {
+        unsigned long huge_totalpages = 1000000000UL;
+        long points = got_oom_badness(task, huge_totalpages);
+        
+        long adj_part = points / (huge_totalpages / 1000);
+        if (adj_part > 200) {
+            return;
+        }
+    }
+
+     if (strcmp(type_name, "rt_sigqueueinfo") == 0 ||
+        strcmp(type_name, "tgkill") == 0 ||
+        strcmp(type_name, "tkill") == 0 ||
+        strcmp(type_name, "rt_tgsigqueueinfo") == 0) {
+
+        int sig = -1;
+        if (strcmp(type_name, "tkill") == 0) {
+            sig = args->arg1;
+        } else if (strcmp(type_name, "tgkill") == 0) {
+            sig = args->arg2;
+        } else if (strcmp(type_name, "rt_sigqueueinfo") == 0) {
+            sig = args->arg1;
+        } else if (strcmp(type_name, "rt_tgsigqueueinfo") == 0) {
+            sig = args->arg2;
+        }
+
+        if (sig > 0) {
+            int fatal_signals[] = {
+                2,  // SIGINT
+                3,  // SIGQUIT
+                4,  // SIGILL
+                6,  // SIGABRT
+                8, // SIGFPE
+                9,  // SIGKILL
+                11,  // SIGSEGV
+                14, // SIGALRM
+                15, // SIGTERM
+            };
+
+            int is_fatal = 0;
+            for (size_t i = 0; i < sizeof(fatal_signals)/sizeof(fatal_signals[0]); i++) {
+                if (sig == fatal_signals[i]) {
+                    is_fatal = 1;
+                    break;
+                }
+            }
+
+            if (!is_fatal) {
+                return;
+            }
+        }
+    }
+
+    struct pt_regs* user_regs = _task_pt_reg(task);
+    print_stack(type_name, cu_uid, user_regs);
+}
+
+void _arm64_force_sig_fault_handler(int signo, int code, unsigned long far, const char *str)
+{
+    struct pt_regs* user_regs = _task_pt_reg(current);
+    print_stack(str, current_uid(), user_regs);
+    ((arm64_force_sig_fault_handler)exception_types[0].backup)(signo, code, far, str);
+}
+
+void el0_undef_handler(struct pt_regs *regs, unsigned long esr)
+{
+    print_stack(exception_types[1].name, current_uid(), regs);
+    ((el0_handler)exception_types[1].backup)(regs, esr);
+};
 
 
 bool init() {
@@ -326,6 +411,13 @@ bool init() {
         return false;
     }
 
+    exception_types[0].origin = (arm64_force_sig_fault_handler)kallsyms_lookup_name("arm64_force_sig_fault");
+    hook(exception_types[0].origin, _arm64_force_sig_fault_handler, &exception_types[0].backup);
+
+    exception_types[1].origin = (el0_handler)kallsyms_lookup_name("el0_undef");
+    hook(exception_types[1].origin, el0_undef_handler, &exception_types[1].backup);
+
+
     got_memdup_user = (find_memdup_user)kallsyms_lookup_name("memdup_user");
     got_kfree = (find_kfree)kallsyms_lookup_name("kfree");
     got_copy_from_user = (find_copy_from_user)kallsyms_lookup_name("copy_from_user");
@@ -333,7 +425,9 @@ bool init() {
     got_get_task_mm = (find_get_task_mm)kallsyms_lookup_name("get_task_mm");
     got_mmput = (find_mmput)kallsyms_lookup_name("mmput");
     got_task_pid_nr_ns = (find_task_pid_nr_ns)kallsyms_lookup_name("__task_pid_nr_ns");
+    got___arm64_sys_getppid = (find___arm64_sys_getppid)kallsyms_lookup_name("__arm64_sys_getppid");
     got_show_map_vma = (find_show_map_vma)kallsyms_lookup_name("show_map_vma");
+    got_oom_badness = (find_oom_badness)kallsyms_lookup_name("oom_badness");
 
     probe_read = (void *)kallsyms_lookup_name("copy_from_kernel_nofault");
     if (!probe_read) {
@@ -376,6 +470,13 @@ static long uninstall(void *__user reserved)
             fp_unhook_syscalln(_exit_type.no, before_exit, 0);
             fp_unhook_compat_syscalln(_exit_type.no, before_exit, 0);
         }
+
+        counter = sizeof(exception_types) / sizeof(exception_types[0]);
+        for (int i = 0; i < counter; i++) {
+            struct exception_type _exception_type = exception_types[i];
+            unhook(_exception_type.origin);
+        }
+
     }
 
     logke("uninstall successful\n");
